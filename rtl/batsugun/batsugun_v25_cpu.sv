@@ -361,14 +361,24 @@ function automatic [31:0] timer_period;
     input [15:0] md_value;
     input [7:0]  control;
     input [7:0]  prc_value;
-    reg [3:0] divider;
+    reg [31:0] md_extended;
+    reg [31:0] md_times_3;
     begin
-        case (prc_value[1:0])
-            2'b00: divider = 4'd2;
-            2'b01: divider = 4'd4;
-            default: divider = 4'd8;
-        endcase
-        timer_period = md_value * divider * (control[6] ? 32'd128 : 32'd6);
+        md_extended = {16'd0, md_value};
+        md_times_3 = md_extended + (md_extended << 1);
+        if (control[6]) begin
+            case (prc_value[1:0])
+                2'b00: timer_period = md_extended << 8;
+                2'b01: timer_period = md_extended << 9;
+                default: timer_period = md_extended << 10;
+            endcase
+        end else begin
+            case (prc_value[1:0])
+                2'b00: timer_period = md_times_3 << 2;
+                2'b01: timer_period = md_times_3 << 3;
+                default: timer_period = md_times_3 << 4;
+            endcase
+        end
     end
 endfunction
 

@@ -486,7 +486,7 @@ wire [31:0] ss_joystick =
 savestate_ui #(.INFO_TIMEOUT_BITS(25)) u_savestate_ui (
     .clk            ( clk_rom          ),
     .ps2_key        ( ps2_key          ),
-    .allow_ss       ( !game_rst && !dwnld_busy && !ss_active ),
+    .allow_ss       ( !rst96 && !dwnld_busy && !ss_active ),
     .joySS          ( ss_joystick[13]  ),
     .joyRight       ( ss_joystick[0]   ),
     .joyLeft        ( ss_joystick[1]   ),

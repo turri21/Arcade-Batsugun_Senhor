@@ -59,10 +59,11 @@ module batsugun_gp9001_stub #(
     output            ss_ack
 );
 
-localparam ST_IDLE   = 2'd0;
-localparam ST_RD_0   = 2'd1;
-localparam ST_RD_1   = 2'd2;
-localparam ST_RD_OUT = 2'd3;
+localparam ST_IDLE     = 3'd0;
+localparam ST_DISPATCH = 3'd1;
+localparam ST_RD_0     = 3'd2;
+localparam ST_RD_1     = 3'd3;
+localparam ST_RD_OUT   = 3'd4;
 localparam [12:0] OBJ_BASE = 13'h1800;
 localparam [9:0]  OBJ_LAST = 10'h3ff;
 localparam [1:0] OBJ_SYNC_IDLE  = 2'd0;
@@ -70,7 +71,12 @@ localparam [1:0] OBJ_SYNC_READ  = 2'd1;
 localparam [1:0] OBJ_SYNC_WAIT  = 2'd2;
 localparam [1:0] OBJ_SYNC_WRITE = 2'd3;
 
-reg [1:0]  state = ST_IDLE;
+reg [2:0]  state = ST_IDLE;
+reg        req_rw = 1'b0;
+reg [3:0]  req_addr = 4'h0;
+reg [15:0] req_din = 16'h0000;
+reg [1:0]  req_we_mask = 2'b00;
+reg        req_status_bit = 1'b0;
 reg [12:0] ptr = 13'h0000;
 reg [7:0]  scroll_reg = 8'hff;
 reg [15:0] scroll_regs [0:15];
@@ -87,6 +93,8 @@ reg [9:0]   obj_sync_index = 10'h000;
 reg [15:0]  obj_sync_data = 16'h0000;
 reg         obj_sync_start_pending = 1'b0;
 reg         obj_boundary_miss = 1'b0;
+reg         obj_restore_pending = 1'b0;
+reg [1:0]   obj_restore_flags = 2'b00;
 reg [1023:0] obj_staging_dirty_lo = {1024{1'b0}};
 reg [1023:0] obj_staging_dirty_hi = {1024{1'b0}};
 wire [12:0] live_scan_addr = obj_scan_live ? obj_scan_addr : scan_addr;
@@ -156,7 +164,7 @@ assign ss_data_out = ss_reg_ack ? ss_reg_data_out :
                      ss_obj1_ack ? ss_obj1_data_out :
                      64'd0;
 
-wire [3:0] op = {addr[3:2], 2'b00};
+wire [3:0] op = {req_addr[3:2], 2'b00};
 wire       op_ram_data = (op == 4'h4);
 wire       op_select   = (op == 4'h8);
 wire       op_status   = (op == 4'hc);
@@ -193,13 +201,13 @@ function [15:0] merge_word;
     end
 endfunction
 
-wire [15:0] ptr_merged = merge_word({3'b000, ptr}, din, we_mask);
-wire [15:0] scroll_select_merged = merge_word({8'h00, scroll_reg}, din, we_mask);
-wire [15:0] scroll_data_merged = merge_word(scroll_regs[scroll_reg[3:0]], din, we_mask);
+wire [15:0] ptr_merged = merge_word({3'b000, ptr}, req_din, req_we_mask);
+wire [15:0] scroll_select_merged = merge_word({8'h00, scroll_reg}, req_din, req_we_mask);
+wire [15:0] scroll_data_merged = merge_word(scroll_regs[scroll_reg[3:0]], req_din, req_we_mask);
 
 // Register chunk: pointer, scroll selector, sixteen scroll registers, then
-// the object snapshot bank/valid flags. Transient bus and copy states are
-// standardized to idle at the save-state quiesce point.
+// the per-axis flip and object snapshot flags. Transient bus and copy states
+// are standardized to idle at the save-state quiesce point.
 always @(posedge clk) begin
     ss_reg_ack <= 1'b0;
 
@@ -238,6 +246,11 @@ always @(posedge clk) begin
     if (rst) begin
         busy <= 1'b0;
         state <= ST_IDLE;
+        req_rw <= 1'b0;
+        req_addr <= 4'h0;
+        req_din <= 16'h0000;
+        req_we_mask <= 2'b00;
+        req_status_bit <= 1'b0;
         ptr <= 13'h0000;
         scroll_reg <= 8'hff;
         dout <= 16'hffff;
@@ -263,32 +276,44 @@ always @(posedge clk) begin
             ST_IDLE: begin
                 if (start && !busy) begin
                     busy <= 1'b1;
-                    dbg_last_addr <= {rw, 11'h000, addr};
-                    dbg_last_din <= din;
+                    req_rw <= rw;
+                    req_addr <= addr;
+                    req_din <= din;
+                    req_we_mask <= we_mask;
+                    req_status_bit <= status_bit;
+                    state <= ST_DISPATCH;
+                end
+            end
 
-                    if (rw) begin
+            ST_DISPATCH: begin
+                dbg_last_addr <= {req_rw, 11'h000, req_addr};
+                dbg_last_din <= req_din;
+
+                    if (req_rw) begin
                         if (op_ram_data) begin
                             ram_addr <= ptr;
                             ptr <= ptr + 13'd1;
                             state <= ST_RD_0;
                         end else if (op_status) begin
-                            dout <= {15'h0000, status_bit};
-                            dbg_last_dout <= {15'h0000, status_bit};
+                            dout <= {15'h0000, req_status_bit};
+                            dbg_last_dout <= {15'h0000, req_status_bit};
                             done <= 1'b1;
                             busy <= 1'b0;
+                            state <= ST_IDLE;
                         end else begin
                             dout <= 16'hffff;
                             dbg_last_dout <= 16'hffff;
                             done <= 1'b1;
                             busy <= 1'b0;
+                            state <= ST_IDLE;
                         end
                     end else begin
                         if (op == 4'h0) begin
                             ptr <= ptr_merged[12:0];
                         end else if (op_ram_data) begin
                             ram_addr <= ptr;
-                            ram_din <= din;
-                            ram_we <= we_mask;
+                            ram_din <= req_din;
+                            ram_we <= req_we_mask;
                             ptr <= ptr + 13'd1;
                         end else if (op_select) begin
                             scroll_reg <= scroll_select_merged[7:0] & 8'h8f;
@@ -307,8 +332,8 @@ always @(posedge clk) begin
                         dbg_last_dout <= 16'hffff;
                         done <= 1'b1;
                         busy <= 1'b0;
+                        state <= ST_IDLE;
                     end
-                end
             end
 
             ST_RD_0: begin
@@ -345,11 +370,16 @@ always @(posedge clk) begin
         obj_sync_data <= 16'h0000;
         obj_sync_start_pending <= 1'b0;
         obj_boundary_miss <= 1'b0;
+        obj_restore_pending <= 1'b0;
+        obj_restore_flags <= 2'b00;
         obj_staging_dirty_lo <= {1024{1'b0}};
         obj_staging_dirty_hi <= {1024{1'b0}};
     end else if (ss_reg_restore_write && (ss_addr == 32'd18)) begin
-        obj_active_bank <= ss_data[0];
-        obj_snapshot_valid <= ss_data[1];
+        obj_restore_pending <= 1'b1;
+        obj_restore_flags <= ss_data[1:0];
+    end else if (obj_restore_pending) begin
+        obj_active_bank <= obj_restore_flags[0];
+        obj_snapshot_valid <= obj_restore_flags[1];
         obj_init_active <= 1'b0;
         obj_init_index <= 10'h000;
         obj_sync_state <= OBJ_SYNC_IDLE;
@@ -357,6 +387,7 @@ always @(posedge clk) begin
         obj_sync_data <= 16'h0000;
         obj_sync_start_pending <= 1'b0;
         obj_boundary_miss <= 1'b0;
+        obj_restore_pending <= 1'b0;
         obj_staging_dirty_lo <= {1024{1'b0}};
         obj_staging_dirty_hi <= {1024{1'b0}};
     end else if (!ss_hold) begin

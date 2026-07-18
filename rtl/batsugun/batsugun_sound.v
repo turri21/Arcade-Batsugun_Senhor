@@ -395,7 +395,13 @@ always @(posedge clk_sound or posedge sound_reset) begin
     else if (!ym_reset_count[5] && ym_cen_p1)
         ym_reset_count <= ym_reset_count + 6'd1;
 end
-wire ym_reset = sound_reset | ~ym_reset_count[5];
+reg ym_reset = 1'b1;
+always @(posedge clk_sound or posedge sound_reset) begin
+    if (sound_reset)
+        ym_reset <= 1'b1;
+    else
+        ym_reset <= ~ym_reset_count[5];
+end
 wire ym_ready = ~ym_reset;
 
 reg [7:0] oki_accumulator = 8'd0;

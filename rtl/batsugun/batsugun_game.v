@@ -130,14 +130,16 @@ localparam V_START = 9'd0;
 localparam V_END   = 9'd240;
 localparam H_PREFETCH_START = H_TOTAL - 10'd32;
 localparam [8:0] GP_HBLANK_PREFETCH_X_ADD = 9'd80; // hcnt 400..431 -> x 480..511
-localparam OBJ_CACHE_SCAN_V = 9'd258;
+// The object snapshot bank flips at the end of line 239. Scan it immediately
+// in vblank so the 64-line renderer queue is populated before visible line 0.
+localparam OBJ_CACHE_SCAN_V = V_END;
 localparam OBJ_CACHE_SCAN_H = 10'd0;
 localparam OBJ_SCROLL_BYPASS_TEST = 1'b0;
 localparam OBJ_VISIBLE_CACHE_TEST = 1'b1;
 localparam OBJ_LINE_SECONDARY_FETCH = 1'b1;
 localparam ENABLE_OBJ_LINEBUFFER_COMPOSITE = 1'b1;
 localparam OBJ_PRIORITY_EVEN_MASK_TEST = 1'b1;
-localparam [8:0] OBJ_LB_URGENT_LINES = 9'd16;
+localparam [8:0] OBJ_LB_URGENT_LINES = 9'd63;
 localparam COMP_MISS_HOLD_LAST_TEST = 1'b0;
 localparam [6:0] PRESSURE_HOLD_FRAMES = 7'd119;
 localparam COMP_BANKED_SCROLL_DIAG = 1'b0;
@@ -1010,11 +1012,13 @@ reg [9:0] hcnt = 10'd0;
 reg [8:0] vcnt = 9'd0;
 wire render_lhbl;
 wire render_lvbl;
-wire debug_frame_tick = (clkdiv == 4'd13) &&
-                        (hcnt == (H_TOTAL - 10'd1)) &&
-                        (vcnt == (V_TOTAL - 9'd1));
-wire debug_line_tick = (clkdiv == 4'd13) &&
-                       (hcnt == (H_TOTAL - 10'd1));
+wire debug_frame_tick_pre = (clkdiv == 4'd12) &&
+                            (hcnt == (H_TOTAL - 10'd1)) &&
+                            (vcnt == (V_TOTAL - 9'd1));
+wire debug_line_tick_pre = (clkdiv == 4'd12) &&
+                           (hcnt == (H_TOTAL - 10'd1));
+reg debug_frame_tick = 1'b0;
+reg debug_line_tick = 1'b0;
 wire [15:0] rom_slot_dout;
 wire        rom_slot_ok;
 wire        rom_slot_rd;
@@ -1066,9 +1070,19 @@ wire         sound_diag_cpu_wait3 = 1'b0;
 `endif
 reg [19:0] gfx_startup_hold = 20'hfffff;
 wire gfx_startup_reset = |gfx_startup_hold;
-wire rom_runtime_reset = rst || dwnld_busy || ioctl_rom ||
+wire rom_runtime_reset = rst96 || dwnld_busy || ioctl_rom ||
                          gfx_startup_reset;
 wire video_runtime_reset = rom_runtime_reset || ss_video_reset;
+
+always @(posedge clk) begin
+    if (video_runtime_reset) begin
+        debug_frame_tick <= 1'b0;
+        debug_line_tick <= 1'b0;
+    end else begin
+        debug_frame_tick <= debug_frame_tick_pre;
+        debug_line_tick <= debug_line_tick_pre;
+    end
+end
 reg  [AW-1:0] gfx_req_addr = {AW{1'b0}};
 reg  [AW-1:0] gfx_req_high_addr = {AW{1'b0}};
 reg  [8:0] gfx_req_target_x = 9'd0;
@@ -1082,6 +1096,9 @@ reg        gfx_req_valid = 1'b0;
 reg  [6:0] gfx_req_color = 7'h00;
 reg  [3:0] gfx_req_pri = 4'h0;
 reg  [15:0] gfx_fetch_lo = 16'h0000;
+reg  [15:0] gfx_fetch_hi = 16'h0000;
+reg  [4:0] gfx_store_idx = 5'd0;
+reg        gfx_store_pending = 1'b0;
 reg  [AW-1:0] gfx_req_probe_addr = {AW{1'b0}};
 reg  [AW-1:0] gfx_req_probe_high_addr = {AW{1'b0}};
 reg  [8:0] gfx_req_probe_target_x = 9'd0;
@@ -1095,6 +1112,9 @@ reg        gfx_req_probe_valid = 1'b0;
 reg  [6:0] gfx_req_probe_color = 7'h00;
 reg  [3:0] gfx_req_probe_pri = 4'h0;
 reg  [15:0] gfx_fetch_probe_lo = 16'h0000;
+reg  [15:0] gfx_fetch_probe_hi = 16'h0000;
+reg  [4:0] gfx_store_probe_idx = 5'd0;
+reg        gfx_store_probe_pending = 1'b0;
 reg        gfx_seen_ok = 1'b0;
 reg  [12:0] gp0_comp_scan_addr = 13'h0000;
 reg  [12:0] gp1_comp_scan_addr = 13'h0000;
@@ -1203,6 +1223,11 @@ reg  [15:0] gp1_obj_attr [0:OBJ_AUX_COUNT-1];
 reg  [17:0] gp1_obj_code [0:OBJ_AUX_COUNT-1];
 reg  [15:0] gp1_obj_raw_x [0:OBJ_AUX_COUNT-1];
 reg  [15:0] gp1_obj_raw_y [0:OBJ_AUX_COUNT-1];
+// Keep just the vertical extent of every cached object in asynchronously
+// readable logic. Most objects miss a given line, so this avoids paying the
+// packed M10K cache's registered read latency before rejecting them.
+reg  [16:0] gp0_obj_line_meta [0:(1 << OBJ_CACHE_ADDR_W)-1];
+reg  [16:0] gp1_obj_line_meta [0:(1 << OBJ_CACHE_ADDR_W)-1];
 `ifdef BATSUGUN_HW_DEBUG
 reg  [19:0] obj_trace_frame = 20'h00000;
 reg  [15:0] gp0_obj_trace_attr3 = 16'h0000;
@@ -1520,6 +1545,10 @@ wire [19:0] gp0_obj_lb_build_q;
 wire [19:0] gp1_obj_lb_build_q;
 wire [19:0] gp0_obj_lb_display_q;
 wire [19:0] gp1_obj_lb_display_q;
+reg  [19:0] gp0_obj_lb_display_px = 20'h00000;
+reg  [19:0] gp1_obj_lb_display_px = 20'h00000;
+reg         obj_lb_display_ready_px = 1'b0;
+reg  [3:0]  obj_lb_display_epoch_px = 4'd0;
 wire [OBJ_CACHE_DATA_W-1:0] gp0_obj_cache_q;
 wire [OBJ_CACHE_DATA_W-1:0] gp1_obj_cache_q;
 reg  [AW-1:0] gfx_fixed_probe_addr = {AW{1'b0}};
@@ -1647,6 +1676,7 @@ wire        cpu_fc0;
 wire        cpu_fc1;
 wire        cpu_fc2;
 wire        rom_probe_match;
+reg         rom_probe_passed = 1'b0;
 wire        cpu_vpa_n = ~&{cpu_fc0, cpu_fc1, cpu_fc2, ~cpu_as_n};
 wire        cpu_iack = !cpu_as_n && cpu_fc0 && cpu_fc1 && cpu_fc2;
 wire        cpu_bus_active = !cpu_as_n && (!cpu_uds_n || !cpu_lds_n);
@@ -1660,8 +1690,8 @@ wire        ss_irq_vector_cs = ss_override && cpu_bus_active &&
 wire        ss_special_cs = ss_handler_cs ||
                             ss_reset_vector_cs ||
                             ss_irq_vector_cs;
-wire        cpu_reset_base = rst || dwnld_busy || ioctl_rom ||
-                             !rom_probe_match || sound_diag_core_reset;
+wire        cpu_reset_base = rst96 || dwnld_busy || ioctl_rom ||
+                             !rom_probe_passed || sound_diag_core_reset;
 wire        cpu_program_space = cpu_fc1 && !cpu_fc0;
 reg  [14:0] v25_stub_addr = 15'h0000;
 reg         v25_stub_done = 1'b0;
@@ -2081,7 +2111,7 @@ assign ss_data_out = ss_global_ack ? ss_global_data_out :
 // Preserve only that durable music intent; replaying voice or SFX on load
 // would create sounds that did not exist at the restored gameplay instant.
 always @(posedge clk) begin
-    if (rst || dwnld_busy || ioctl_rom) begin
+    if (rst96 || dwnld_busy || ioctl_rom) begin
         sound_bgm_pending_argument <= 8'h00;
         sound_bgm_command <= 8'h00;
         sound_bgm_argument <= 8'h00;
@@ -2115,7 +2145,7 @@ end
 always @(posedge clk) begin
     ss_global_ack <= 1'b0;
 
-    if (rst) begin
+    if (rst96) begin
         ss_global_data_out <= 64'd0;
         ss_restore_ssp <= 32'd0;
         ss_restore_irq4 <= 1'b0;
@@ -2170,7 +2200,7 @@ end
 // private handler that stacks every architectural 68000 register into work
 // RAM, exposes SSP at ff0000, and later restores the same frame with RTE.
 always @(posedge clk) begin
-    if (rst || dwnld_busy || ioctl_rom) begin
+    if (rst96 || dwnld_busy || ioctl_rom) begin
         ss_state <= SS_IDLE;
         ss_write_start <= 1'b0;
         ss_read_start <= 1'b0;
@@ -2313,7 +2343,7 @@ reg [3:0]  ss_hw_prev_state = SS_IDLE;
 reg [31:0] ss_hw_state_age = 32'd0;
 
 always @(posedge clk) begin
-    if (rst || dwnld_busy || ioctl_rom) begin
+    if (rst96 || dwnld_busy || ioctl_rom) begin
         ss_hw_prev_state <= SS_IDLE;
         ss_hw_state_age <= 32'd0;
     end else begin
@@ -2623,7 +2653,14 @@ wire [1:0] gp_render_layer_raw = status[24:23];
 wire [1:0] gp_gfx_decode_mode = status[26:25];
 wire [1:0] gp_gfx_map_mode = status[28:27];
 wire [1:0] gp_tile_word_mode = status[30:29];
-wire gp_tile_hex_mode = status[31];
+reg gp_tile_hex_mode = 1'b0;
+always @(posedge clk) begin
+    if (rst96) begin
+        gp_tile_hex_mode <= 1'b0;
+    end else begin
+        gp_tile_hex_mode <= status[31];
+    end
+end
 wire [1:0] gp_live_gfx_decode_mode = GP_LIVE_GFX_DECODE_MODE;
 wire [1:0] gp_live_gfx_map_mode = GP_LIVE_GFX_MAP_MODE;
 wire [15:0] gfx_probe_slot_word = gfx_probe_slot_dout;
@@ -2710,10 +2747,29 @@ batsugun_obj_cache_ram #(
     .rd_data (gp1_obj_cache_q)
 );
 
+always @(posedge clk) begin
+    if (gp0_obj_cache_we) begin
+        gp0_obj_line_meta[gp0_obj_count] <=
+            {gp0_obj_stage_draw_y, gp0_obj_stage_h};
+    end
+    if (gp1_obj_cache_we) begin
+        gp1_obj_line_meta[gp1_obj_count] <=
+            {gp1_obj_stage_draw_y, gp1_obj_stage_h};
+    end
+end
+
 wire [6:0] obj_lb_selected_count = obj_lb_gp_sel ?
                                    gp1_obj_count : gp0_obj_count;
 wire [OBJ_CACHE_DATA_W-1:0] obj_lb_selected_cache_q = obj_lb_gp_sel ?
     gp1_obj_cache_q : gp0_obj_cache_q;
+wire [16:0] obj_lb_selected_line_meta = obj_lb_gp_sel ?
+    gp1_obj_line_meta[obj_lb_slot] : gp0_obj_line_meta[obj_lb_slot];
+wire [8:0] obj_lb_selected_y_fast = obj_lb_selected_line_meta[16:8];
+wire [7:0] obj_lb_selected_h_fast = obj_lb_selected_line_meta[7:0];
+wire [8:0] obj_lb_selected_dy_fast =
+    obj_lb_target_y - obj_lb_selected_y_fast;
+wire obj_lb_selected_on_line_fast =
+    obj_lb_selected_dy_fast < {1'b0, obj_lb_selected_h_fast};
 wire [8:0] obj_lb_selected_x = obj_lb_selected_cache_q[67:59];
 wire [8:0] obj_lb_selected_y = obj_lb_selected_cache_q[58:50];
 wire [7:0] obj_lb_selected_w = obj_lb_selected_cache_q[49:42];
@@ -2721,8 +2777,6 @@ wire [7:0] obj_lb_selected_h = obj_lb_selected_cache_q[41:34];
 wire [15:0] obj_lb_selected_attr = obj_lb_selected_cache_q[33:18];
 wire [17:0] obj_lb_selected_code = obj_lb_selected_cache_q[17:0];
 wire [8:0] obj_lb_selected_dy = obj_lb_target_y - obj_lb_selected_y;
-wire obj_lb_selected_on_line =
-    obj_lb_selected_dy < {1'b0, obj_lb_selected_h};
 wire [4:0] obj_lb_selected_w_tiles = obj_lb_selected_w[7:3];
 wire [4:0] obj_lb_selected_h_tiles = obj_lb_selected_h[7:3];
 wire [4:0] obj_lb_selected_tile_y = obj_lb_selected_attr[13] ?
@@ -2800,25 +2854,25 @@ wire gp1_obj_lb_we = obj_lb_clear_we ||
 wire [3:0] obj_lb_display_epoch =
     obj_lb_bank_epoch[vcnt[OBJ_LB_BANK_BITS-1:0]];
 wire gp0_obj_lb_opaque = obj_linebuffer_render_en && gp_tile_area &&
-                         obj_lb_display_ready &&
-                         (gp0_obj_lb_display_q[19:16] == obj_lb_display_epoch) &&
-                         gp0_obj_lb_display_q[15] &&
-                         (gp0_obj_lb_display_q[3:0] != 4'h0);
+                         obj_lb_display_ready_px &&
+                         (gp0_obj_lb_display_px[19:16] == obj_lb_display_epoch_px) &&
+                         gp0_obj_lb_display_px[15] &&
+                         (gp0_obj_lb_display_px[3:0] != 4'h0);
 wire gp1_obj_lb_opaque = obj_linebuffer_render_en && gp_tile_area &&
-                         obj_lb_display_ready &&
-                         (gp1_obj_lb_display_q[19:16] == obj_lb_display_epoch) &&
-                         gp1_obj_lb_display_q[15] &&
-                         (gp1_obj_lb_display_q[3:0] != 4'h0);
+                         obj_lb_display_ready_px &&
+                         (gp1_obj_lb_display_px[19:16] == obj_lb_display_epoch_px) &&
+                         gp1_obj_lb_display_px[15] &&
+                         (gp1_obj_lb_display_px[3:0] != 4'h0);
 wire [3:0] gp0_obj_lb_pri_eff = OBJ_PRIORITY_EVEN_MASK_TEST ?
-                                 (gp0_obj_lb_display_q[14:11] & 4'he) :
-                                  gp0_obj_lb_display_q[14:11];
+                                 (gp0_obj_lb_display_px[14:11] & 4'he) :
+                                  gp0_obj_lb_display_px[14:11];
 wire [3:0] gp1_obj_lb_pri_eff = OBJ_PRIORITY_EVEN_MASK_TEST ?
-                                 (gp1_obj_lb_display_q[14:11] & 4'he) :
-                                  gp1_obj_lb_display_q[14:11];
+                                 (gp1_obj_lb_display_px[14:11] & 4'he) :
+                                  gp1_obj_lb_display_px[14:11];
 wire [14:0] gp0_obj_lb_pixel = {gp0_obj_lb_pri_eff,
-                                gp0_obj_lb_display_q[10:0]};
+                                gp0_obj_lb_display_px[10:0]};
 wire [14:0] gp1_obj_lb_pixel = {gp1_obj_lb_pri_eff,
-                                gp1_obj_lb_display_q[10:0]};
+                                gp1_obj_lb_display_px[10:0]};
 
 batsugun_obj_line_ram #(
     .ADDR_W (OBJ_LB_ADDR_BITS),
@@ -2845,6 +2899,23 @@ batsugun_obj_line_ram #(
     .display_addr(obj_lb_display_addr),
     .display_q  (gp1_obj_lb_display_q)
 );
+
+// Port B captures the new hcnt/vcnt address on clkdiv==0. Register its data
+// one cycle later so the palette compositor does not span the M10K-to-pixel
+// distance in a single clock; palette sampling remains at clkdiv==8.
+always @(posedge clk) begin
+    if (video_runtime_reset) begin
+        gp0_obj_lb_display_px <= 20'h00000;
+        gp1_obj_lb_display_px <= 20'h00000;
+        obj_lb_display_ready_px <= 1'b0;
+        obj_lb_display_epoch_px <= 4'd0;
+    end else if (clkdiv == 4'd1) begin
+        gp0_obj_lb_display_px <= gp0_obj_lb_display_q;
+        gp1_obj_lb_display_px <= gp1_obj_lb_display_q;
+        obj_lb_display_ready_px <= obj_lb_display_ready;
+        obj_lb_display_epoch_px <= obj_lb_display_epoch;
+    end
+end
 wire [3:0] obj_gfx_debug_slot_select = {gp_tile_word_mode, gp_gfx_map_mode};
 wire [3:0] obj_gfx_debug_tile_select = 4'd0;
 wire [7:0] obj_gfx_debug_tile_page = {obj_gfx_debug_tile_select, 4'd0};
@@ -3358,6 +3429,28 @@ wire [4:0] comp_word_cache_fetch_idx2 = {3'd2, gp_comp_fetch_target_x[4:3]};
 wire [4:0] comp_word_cache_fetch_idx3 = {3'd3, gp_comp_fetch_target_x[4:3]};
 wire [4:0] comp_word_cache_fetch_idx4 = {3'd4, gp_comp_fetch_target_x[4:3]};
 wire [4:0] comp_word_cache_fetch_idx5 = {3'd5, gp_comp_fetch_target_x[4:3]};
+wire [4:0] gfx_req_cache_idx = {gfx_req_slot, gfx_req_target_x[4:3]};
+wire [4:0] gfx_req_probe_cache_idx =
+    {gfx_req_probe_slot, gfx_req_probe_target_x[4:3]};
+wire gfx_req_cache_retag =
+    ((clkdiv == 4'd5) && (gfx_req_slot == 3'd0) &&
+     gp0_l0_word_start && (comp_word_cache_fetch_idx0 == gfx_req_cache_idx)) ||
+    ((clkdiv == 4'd9) && (gfx_req_slot == 3'd1) &&
+     gp0_l1_word_start && (comp_word_cache_fetch_idx1 == gfx_req_cache_idx)) ||
+    ((clkdiv == 4'd13) && (gfx_req_slot == 3'd2) &&
+     !(COMP_BANKED_SCROLL_DIAG && debug_frame_tick) &&
+     gp0_l2_word_start && (comp_word_cache_fetch_idx2 == gfx_req_cache_idx));
+wire gfx_req_probe_cache_retag =
+    ((clkdiv == 4'd5) && (gfx_req_probe_slot == 3'd3) &&
+     gp1_l0_word_start &&
+     (comp_word_cache_fetch_idx3 == gfx_req_probe_cache_idx)) ||
+    ((clkdiv == 4'd9) && (gfx_req_probe_slot == 3'd4) &&
+     gp1_l1_word_start &&
+     (comp_word_cache_fetch_idx4 == gfx_req_probe_cache_idx)) ||
+    ((clkdiv == 4'd13) && (gfx_req_probe_slot == 3'd5) &&
+     !(COMP_BANKED_SCROLL_DIAG && debug_frame_tick) &&
+     gp1_l2_word_start &&
+     (comp_word_cache_fetch_idx5 == gfx_req_probe_cache_idx));
 wire [5:0] comp_prefetch_ready = {
     comp_word_cache_ready[comp_word_cache_idx5] &&
         (comp_word_cache_target_x[comp_word_cache_idx5] == gp_comp_hcnt) &&
@@ -3601,9 +3694,6 @@ wire video_profile_primary_complete = gfx_req_pending && gfx_req_phase &&
                                       gfx_scroll_slot_ok;
 wire video_profile_probe_complete = gfx_req_probe_pending &&
                                     gfx_req_probe_phase && gfx_probe_slot_ok;
-wire [4:0] gfx_req_cache_idx = {gfx_req_slot, gfx_req_target_x[4:3]};
-wire [4:0] gfx_req_probe_cache_idx =
-    {gfx_req_probe_slot, gfx_req_probe_target_x[4:3]};
 wire video_profile_primary_stage_collision = video_profile_primary_complete &&
     comp_word_cache_ready[gfx_req_cache_idx] &&
     (comp_word_cache_target_x[gfx_req_cache_idx] == gfx_req_target_x) &&
@@ -4388,7 +4478,7 @@ assign dwnld_busy = ioctl_rom | prog_we | download_prom_we;
 // programming state can strand its first transaction. Keep video requesters
 // idle for about 11 ms after each ROM download before starting normal reads.
 always @(posedge clk) begin
-    if (rst || dwnld_busy || ioctl_rom)
+    if (rst96 || dwnld_busy || ioctl_rom)
         gfx_startup_hold <= 20'hfffff;
     else if (gfx_startup_reset)
         gfx_startup_hold <= gfx_startup_hold - 20'd1;
@@ -4723,7 +4813,7 @@ wire [127:0] video_profile_trace_motion = video_profile_boot_trace_enable ?
 
 batsugun_video_profiler u_video_profiler (
     .clk               (clk),
-    .rst               (rst || dwnld_busy || ioctl_rom),
+    .rst               (rst96 || dwnld_busy || ioctl_rom),
     .enable            (video_profile_source[3]),
     .clear_toggle      (video_profile_source[5]),
     .snapshot_toggle   (video_profile_source[4]),
@@ -4815,7 +4905,7 @@ jtframe_68kdtack_cen #(.W(8), .MFREQ(94500), .WAIT1(CPU_FIXED_WAIT)) u_cpu_dtack
 
 fx68k u_main68k (
     .clk        ( clk            ),
-    .HALTn      ( 1'b1           ),
+    .HALTn      ( dip_pause && (!ss_active_freeze || ss_cpu_run) ),
     .extReset   ( cpu_core_reset ),
     .pwrUp      ( cpu_core_reset ),
     .enPhi1     ( cpu_cen && ss_cpu_run  ),
@@ -4952,8 +5042,17 @@ jtframe_dual_ram #(.DW(8), .AW(9)) u_v25_boot_shadow(
     .q1         ( v25_boot_shadow_data   )
 );
 
+reg sound_core_reset = 1'b1;
+always @(posedge clk96) begin
+    if (rst96) begin
+        sound_core_reset <= 1'b1;
+    end else begin
+        sound_core_reset <= dwnld_busy || !v25_stub_done;
+    end
+end
+
 batsugun_sound u_sound (
-    .reset              ( rst96 || dwnld_busy || !v25_stub_done ),
+    .reset              ( sound_core_reset        ),
     .clk16              ( clk96                   ),
     .v25_cen            ( v25_cen && ss_v25_run   ),
     .clk_sound          ( clk96                   ),
@@ -5338,7 +5437,7 @@ batsugun_gp9001_stub #(
 );
 
 always @(posedge clk) begin
-    if (rst || dwnld_busy || ioctl_rom) begin
+    if (rst96 || dwnld_busy || ioctl_rom) begin
         gp0_scroll0_px <= 16'h0000;
         gp0_scroll1_px <= 16'h0000;
         gp0_scroll2_px <= 16'h0000;
@@ -5775,7 +5874,7 @@ always @(posedge clk) begin
                         obj_lb_req_hold <= 1'b0;
                         obj_lb_line_cycles <= 13'd0;
                         obj_lb_state <= (obj_lb_target_epoch_next == 4'd0) ?
-                                        OBJ_LB_CLEAR : OBJ_LB_CACHE_WAIT;
+                                        OBJ_LB_CLEAR : OBJ_LB_OBJECT;
                     end
                 end
 
@@ -5784,7 +5883,7 @@ always @(posedge clk) begin
                         obj_lb_clear_x <= 9'd0;
                         obj_lb_gp_sel <= 1'b0;
                         obj_lb_slot <= 7'd0;
-                        obj_lb_state <= OBJ_LB_CACHE_WAIT;
+                        obj_lb_state <= OBJ_LB_OBJECT;
                     end else begin
                         obj_lb_clear_x <= obj_lb_clear_x + 9'd1;
                     end
@@ -5797,7 +5896,16 @@ always @(posedge clk) begin
                 // The cache M10Ks register both their address and output.
                 // Keep the slot stable for both cycles before consuming q.
                 OBJ_LB_CACHE_READ: begin
-                    obj_lb_state <= OBJ_LB_OBJECT;
+                    obj_lb_obj_x <= obj_lb_selected_x;
+                    obj_lb_obj_w <= obj_lb_selected_w;
+                    obj_lb_obj_h <= obj_lb_selected_h;
+                    obj_lb_obj_attr <= obj_lb_selected_attr;
+                    obj_lb_obj_code <= obj_lb_selected_code;
+                    obj_lb_w_tiles <= obj_lb_selected_w_tiles;
+                    obj_lb_tile_x <= 5'd0;
+                    obj_lb_tile_y <= obj_lb_selected_tile_y;
+                    obj_lb_row <= obj_lb_selected_row;
+                    obj_lb_state <= OBJ_LB_TILE;
                 end
 
                 OBJ_LB_OBJECT: begin
@@ -5805,7 +5913,7 @@ always @(posedge clk) begin
                         if (!obj_lb_gp_sel) begin
                             obj_lb_gp_sel <= 1'b1;
                             obj_lb_slot <= 7'd0;
-                            obj_lb_state <= OBJ_LB_CACHE_WAIT;
+                            obj_lb_state <= OBJ_LB_OBJECT;
                         end else begin
                             obj_lb_bank_ready[obj_lb_build_bank] <= 1'b1;
                             obj_lb_bank_y[obj_lb_build_bank] <= obj_lb_target_y;
@@ -5820,27 +5928,18 @@ always @(posedge clk) begin
                             end
                             obj_lb_state <= OBJ_LB_IDLE;
                         end
-                    end else if (obj_lb_selected_on_line) begin
-                        obj_lb_obj_x <= obj_lb_selected_x;
-                        obj_lb_obj_w <= obj_lb_selected_w;
-                        obj_lb_obj_h <= obj_lb_selected_h;
-                        obj_lb_obj_attr <= obj_lb_selected_attr;
-                        obj_lb_obj_code <= obj_lb_selected_code;
-                        obj_lb_w_tiles <= obj_lb_selected_w_tiles;
-                        obj_lb_tile_x <= 5'd0;
-                        obj_lb_tile_y <= obj_lb_selected_tile_y;
-                        obj_lb_row <= obj_lb_selected_row;
-                        obj_lb_state <= OBJ_LB_TILE;
+                    end else if (obj_lb_selected_on_line_fast) begin
+                        obj_lb_state <= OBJ_LB_CACHE_WAIT;
                     end else begin
                         obj_lb_slot <= obj_lb_slot + 7'd1;
-                        obj_lb_state <= OBJ_LB_CACHE_WAIT;
+                        obj_lb_state <= OBJ_LB_OBJECT;
                     end
                 end
 
                 OBJ_LB_TILE: begin
                     if (obj_lb_tile_x >= obj_lb_w_tiles) begin
                         obj_lb_slot <= obj_lb_slot + 7'd1;
-                        obj_lb_state <= OBJ_LB_CACHE_WAIT;
+                        obj_lb_state <= OBJ_LB_OBJECT;
                     end else if (obj_lb_tile_visible) begin
                         obj_lb_req_addr <= obj_lb_tile_addr_lo;
                         obj_lb_req_high_addr <= obj_lb_tile_addr_hi;
@@ -6952,7 +7051,7 @@ always @(posedge clk) begin
 end
 
 always @(posedge clk) begin
-    if (rst || dwnld_busy || ioctl_rom) begin
+    if (rst96 || dwnld_busy || ioctl_rom) begin
         rom_probe_addr <= 2'd0;
         rom_probe_cs <= 1'b0;
         rom_probe_idx <= 2'd0;
@@ -6961,6 +7060,7 @@ always @(posedge clk) begin
         rom_probe_word1 <= 16'h0000;
         rom_probe_word2 <= 16'h0000;
         rom_probe_word3 <= 16'h0000;
+        rom_probe_passed <= 1'b0;
     end else if (!rom_probe_done) begin
         if (!rom_probe_cs) begin
             rom_probe_addr <= rom_probe_idx;
@@ -6982,6 +7082,12 @@ always @(posedge clk) begin
                 default: begin
                     rom_probe_word3 <= rom_slot_dout;
                     rom_probe_seen[7:6] <= 2'b11;
+                    rom_probe_passed <=
+                        (rom_probe_word0 == 16'h0011) &&
+                        (rom_probe_word1 == 16'h0000) &&
+                        (rom_probe_word2 == 16'h0003) &&
+                        ((rom_slot_dout == 16'hbc60) ||
+                         (rom_slot_dout == 16'hc460));
                 end
             endcase
             rom_probe_idx <= rom_probe_idx + 2'd1;
@@ -6991,7 +7097,7 @@ always @(posedge clk) begin
 end
 
 always @(posedge clk) begin
-    if (rst || dwnld_busy || ioctl_rom) begin
+    if (rst96 || dwnld_busy || ioctl_rom) begin
         gfx_fixed_probe_addr <= {AW{1'b0}};
         gfx_fixed_probe_cs <= 1'b0;
         gfx_fixed_probe_idx <= 3'd0;
@@ -7102,40 +7208,6 @@ task comp_latch_prefetch;
     end
 endtask
 
-task comp_store_prefetch;
-    input [2:0] slot;
-    reg [4:0] target_idx;
-    begin
-        target_idx = {slot, gfx_req_target_x[4:3]};
-        if ((comp_word_cache_target_x[target_idx] == gfx_req_target_x) &&
-            (comp_word_cache_target_y[target_idx] == gfx_req_target_y)) begin
-            comp_word_cache_lo[target_idx] <= gfx_fetch_lo;
-            comp_word_cache_hi[target_idx] <= gfx_scroll_slot_dout;
-            comp_word_cache_color[target_idx] <= gfx_req_color;
-            comp_word_cache_pri[target_idx] <= gfx_req_pri;
-            comp_word_cache_valid[target_idx] <= gfx_req_valid;
-            comp_word_cache_ready[target_idx] <= 1'b1;
-        end
-    end
-endtask
-
-task comp_store_prefetch_probe;
-    input [2:0] slot;
-    reg [4:0] target_idx;
-    begin
-        target_idx = {slot, gfx_req_probe_target_x[4:3]};
-        if ((comp_word_cache_target_x[target_idx] == gfx_req_probe_target_x) &&
-            (comp_word_cache_target_y[target_idx] == gfx_req_probe_target_y)) begin
-            comp_word_cache_lo[target_idx] <= gfx_fetch_probe_lo;
-            comp_word_cache_hi[target_idx] <= gfx_probe_slot_dout;
-            comp_word_cache_color[target_idx] <= gfx_req_probe_color;
-            comp_word_cache_pri[target_idx] <= gfx_req_probe_pri;
-            comp_word_cache_valid[target_idx] <= gfx_req_probe_valid;
-            comp_word_cache_ready[target_idx] <= 1'b1;
-        end
-    end
-endtask
-
 always @(posedge clk) begin
     if (video_runtime_reset || gp_tile_hex_mode) begin
         gfx_req_addr <= {AW{1'b0}};
@@ -7152,6 +7224,9 @@ always @(posedge clk) begin
         gfx_req_pri <= 4'h0;
         gfx_req_slot <= 3'd0;
         gfx_fetch_lo <= 16'h0000;
+        gfx_fetch_hi <= 16'h0000;
+        gfx_store_idx <= 5'd0;
+        gfx_store_pending <= 1'b0;
         gfx_req_probe_addr <= {AW{1'b0}};
         gfx_req_probe_high_addr <= {AW{1'b0}};
         gfx_req_probe_target_x <= 9'd0;
@@ -7166,6 +7241,9 @@ always @(posedge clk) begin
         gfx_req_probe_pri <= 4'h0;
         gfx_req_probe_slot <= 3'd3;
         gfx_fetch_probe_lo <= 16'h0000;
+        gfx_fetch_probe_hi <= 16'h0000;
+        gfx_store_probe_idx <= 5'd0;
+        gfx_store_probe_pending <= 1'b0;
         gfx_seen_ok <= 1'b0;
         gp0_comp_scan_addr <= 13'h0000;
         gp1_comp_scan_addr <= 13'h0000;
@@ -7207,6 +7285,25 @@ always @(posedge clk) begin
             comp_word_cache_ready[comp_cache_i] <= 1'b0;
         end
     end else begin
+        if (gfx_store_pending) begin
+            comp_word_cache_lo[gfx_store_idx] <= gfx_fetch_lo;
+            comp_word_cache_hi[gfx_store_idx] <= gfx_fetch_hi;
+            comp_word_cache_color[gfx_store_idx] <= gfx_req_color;
+            comp_word_cache_pri[gfx_store_idx] <= gfx_req_pri;
+            comp_word_cache_valid[gfx_store_idx] <= gfx_req_valid;
+            comp_word_cache_ready[gfx_store_idx] <= 1'b1;
+        end
+        if (gfx_store_probe_pending) begin
+            comp_word_cache_lo[gfx_store_probe_idx] <= gfx_fetch_probe_lo;
+            comp_word_cache_hi[gfx_store_probe_idx] <= gfx_fetch_probe_hi;
+            comp_word_cache_color[gfx_store_probe_idx] <= gfx_req_probe_color;
+            comp_word_cache_pri[gfx_store_probe_idx] <= gfx_req_probe_pri;
+            comp_word_cache_valid[gfx_store_probe_idx] <= gfx_req_probe_valid;
+            comp_word_cache_ready[gfx_store_probe_idx] <= 1'b1;
+        end
+        gfx_store_pending <= 1'b0;
+        gfx_store_probe_pending <= 1'b0;
+
         if (COMP_BANKED_SCROLL_DIAG && debug_frame_tick) begin
             comp_frame_bank <= ~comp_frame_bank;
             gfx_req_pending <= 1'b0;
@@ -7219,6 +7316,8 @@ always @(posedge clk) begin
             gfx_req_probe_stage <= 1'b0;
             gfx_req_probe_far_stage <= 1'b0;
             gfx_req_probe_deep_stage <= 1'b0;
+            gfx_store_pending <= 1'b0;
+            gfx_store_probe_pending <= 1'b0;
             comp_fetch_pending <= 6'b000000;
             comp_fetch_stage <= 6'b000000;
             comp_fetch_far_stage <= 6'b000000;
@@ -7313,7 +7412,13 @@ always @(posedge clk) begin
                 gfx_fetch_lo <= gfx_scroll_slot_dout;
                 gfx_req_phase <= 1'b1;
             end else begin
-                comp_store_prefetch(gfx_req_slot);
+                gfx_fetch_hi <= gfx_scroll_slot_dout;
+                gfx_store_idx <= gfx_req_cache_idx;
+                gfx_store_pending <= !gfx_req_cache_retag &&
+                    (comp_word_cache_target_x[gfx_req_cache_idx] ==
+                     gfx_req_target_x) &&
+                    (comp_word_cache_target_y[gfx_req_cache_idx] ==
+                     gfx_req_target_y);
                 gfx_seen_ok <= 1'b1;
                 gfx_req_pending <= 1'b0;
                 gfx_req_phase <= 1'b0;
@@ -7354,7 +7459,13 @@ always @(posedge clk) begin
                 gfx_fetch_probe_lo <= gfx_probe_slot_dout;
                 gfx_req_probe_phase <= 1'b1;
             end else begin
-                comp_store_prefetch_probe(gfx_req_probe_slot);
+                gfx_fetch_probe_hi <= gfx_probe_slot_dout;
+                gfx_store_probe_idx <= gfx_req_probe_cache_idx;
+                gfx_store_probe_pending <= !gfx_req_probe_cache_retag &&
+                    (comp_word_cache_target_x[gfx_req_probe_cache_idx] ==
+                     gfx_req_probe_target_x) &&
+                    (comp_word_cache_target_y[gfx_req_probe_cache_idx] ==
+                     gfx_req_probe_target_y);
                 gfx_seen_ok <= 1'b1;
                 gfx_req_probe_pending <= 1'b0;
                 gfx_req_probe_phase <= 1'b0;
@@ -7703,7 +7814,7 @@ always @(posedge clk) begin
     pxl_cen <= 1'b0;
     pxl2_cen <= 1'b0;
 
-    if (rst) begin
+    if (rst96) begin
         red <= 8'h00;
         green <= 8'h00;
         blue <= 8'h00;
@@ -7723,7 +7834,7 @@ always @(posedge clk) begin
             clkdiv <= 4'd0;
             pxl_cen <= 1'b1;
             pxl2_cen <= 1'b1;
-            if (!rst) begin
+            if (!rst96) begin
                 LHBL <= render_lhbl;
                 LVBL <= render_lvbl;
             end
