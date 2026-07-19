@@ -1,3 +1,8 @@
+-=(Batsugun_Senhor notes)=-
+
+Tested: Working Video 720p, 1080p & Sound.
+
+___
 # Batsugun MiSTer Core
 
 This is a vibe coded, MAME-based Batsugun arcade core for the MiSTer FPGA.
